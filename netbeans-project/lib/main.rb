@@ -112,19 +112,22 @@ module TriggerMultipleJenkinsJobs
     commandline_args=ARGV
     @logger.info('parameters passed: ' + commandline_args.to_s)
 
-    never_exit=false
-    if commandline_args[-1] == 'yes'  #this option will make the script not to crash on errors/exceptions etc
-      never_exit=true
-      @logger.debug('never_exit flag is set, won\'t exit on errors')
-    end
-    commandline_args.delete_at(-1)
-
     debug=false
-    if commandline_args[0] == '-d'  #if the first argument "word" is '-d' enable the hidden top secret debug mode
-      commandline_args.shift
-      debug=true
-      @logger.debug("the debug mode is: #{debug}")
+    never_exit=false
+    
+    commandline_args.each do |arg|
+      case arg
+      when '-y'   #this option will make the script not to crash on errors/exceptions etc
+        never_exit=true
+        commandline_args.delete('-y')
+      when '-d'   #if the first argument "word" is '-d' enable the hidden top secret debug mode
+        debug=true
+        commandline_args.delete('-d')
+      end
     end
+    
+    @logger.debug("the never_exit flag is: #{never_exit}")
+    @logger.debug("the debug mode is: #{debug}")
 
     return commandline_args, debug, never_exit
   end
@@ -223,7 +226,20 @@ module TriggerMultipleJenkinsJobs
   def process_name_of_business_component(url, options)
     name_of_business_component=RestClient::Resource.new(url, options[:credentials][:username],options[:credentials][:password])
     (result=trigger_build(name_of_business_component)) ? getjob_function2status(result, options) :
-      @logger.warn("the build job for #{name_of_business_component} has been running for more than 20 minutes, the script will move on to the next job now, please check the status in sonar manually, in 20 minutes") #fixme
+      @logger.warn("the build job for #{name_of_business_component} has been running for more than 20 minutes, the script will move" + 
+        "on to the next job now, please check the status in sonar manually, in 20 minutes") #fixme
+  rescue RestClient::InternalServerError => e
+    @logger.error("the attempt to build #{url.to_s.sub(/^.*job_pattern1/, '').sub(/job_function1.*$/, '')} completed. Result was FAILURE")
+    @logger.error("we got an error 500 (check if the job is disabled?)")      
+    @logger.debug("the exception was: " + e.to_s)
+    @logger.debug("and the backtrace: #{e.backtrace.inspect.to_s}")
+    if options[:never_exit] == true
+      return "the build of " + url.to_s.sub(/^.*job_pattern1/, '').sub(/job_function1.*$/, '') + " failed, " +
+        "we got an error 500 from jenkins," +
+        "this probably means that the job is disabled?"
+    else
+      exit 1
+    end
   end
 
   def trigger_build(object)
@@ -302,15 +318,15 @@ module TriggerMultipleJenkinsJobs
         marked_bad=true
 
         if line=~/.*_architecture2.*/
-          comp_errors <<  '\t The architecture2 build failed:'
+          comp_errors <<  "\n\t" + 'The architecture2 compilation failed:'
           resource=RestClient::Resource.new(url.to_s.sub(/job_function1.*$/, 'job_function2architecture2/') + 'lastBuild/consoleText', 
-            options[:credentials][:username],options[:credentials][:password])  #fixme we assume that the build job will adhere/match with the naming convention used for the poll job
-          comp_errors.concat(find_comp_errors(resource.get)) #fixme -- what if we get an exception (resource not found/404 etc)?
+            options[:credentials][:username],options[:credentials][:password])  #we assume that the build job will adhere/match with the naming convention used for the poll job
+          comp_errors.concat(find_comp_errors(resource.get, options)) #fixme -- what if we get an exception (resource not found/404 etc)?
         elsif line =~ /.*_architecture1.*/
-          comp_errors << '\t The architecture1 build failed:'
+          comp_errors << "\n\t" + 'The architecture1 compilation failed:'
           resource=RestClient::Resource.new(url.to_s.sub(/job_function1.*$/, 'job_function2architecture1/') + 'lastBuild/consoleText', 
-            options[:credentials][:username],options[:credentials][:password])  #fixme what if we get an exception (resource not found/404 etc)?
-          comp_errors.concat(find_comp_errors(resource.get))
+            options[:credentials][:username],options[:credentials][:password])  #fixme -- what if we get an exception (resource not found/404 etc)?
+          comp_errors.concat(find_comp_errors(resource.get, options))
         else
           #fixme -- a build broke but it's not architecture2 or architecture1? throw?
         end
@@ -324,7 +340,7 @@ module TriggerMultipleJenkinsJobs
     end
   end
 
-  def find_comp_errors(build_failures)
+  def find_comp_errors(build_failures, options)
     exclusions = [ '-errwarn',
       'Entering directory',
       '[workspace]',
@@ -346,134 +362,115 @@ module TriggerMultipleJenkinsJobs
       'Leaving directory `/bb/data2/',
       '-march=i686']
 
-    #fixme - it's buggy, instead of the error + previous line, this returns the kitchen sink. Also convert to map(), also .reverse iterate..
-    last_comp_flag = false
-    puts "build failures: " + build_failures
-    error_log=[]
-    build_failures.split('\n').each do |fail_line|
-      found = false
-      if last_comp_flag == false
-        for exclude in exclusions
-          if fail_line.include?(exclude)
-            found=true
-            last_comp_line=fail_line
+    #todo - limit the compilation output returned to the user..
+    
+    errors=build_failures.split("\n")
+    @logger.debug("error logs before processing: #{errors}") if options[:debug]
+      exclusions.each do |exclusion|
+        errors.delete_if {|element| element.include?(exclusion)}
+      end
+    @logger.debug("error logs after processing: #{errors}") if options[:debug]
+      return errors
+    end
+
+    def run
+      @logger=LogDelegator.new
+
+      options, repo_list = init
+
+      if repo_list.length == 0
+        @logger.fatal("the list of repos provided is empty: #{repo_list.to_s}, nothing to do here.. Exiting..")
+        exit 0
+      end
+
+      successful_builds=Queue.new
+      unsuccessful_builds=Queue.new
+      repo_q=Queue.new
+      results_q=Queue.new
+
+      valid_repos = lambda do
+        valid_repos=[]
+        repo_list.each do |repo|
+          (valid_url=get_valid_url(repo,options)) ? valid_repos << valid_url : next
+        end
+        valid_repos
+      end
+
+      valid_repos.call.each do |repo|
+        repo_q.push(repo)
+      end
+
+      @logger.debug("spawning #{options[:thread_count]} thread(s) to process #{repo_q.length} repositories")
+
+      thread_arr=Array.new(options[:thread_count])
+      for thread_num in (0..thread_arr.length - 1) do
+        thread_arr[thread_num]=Thread.new(repo_q, results_q, successful_builds, unsuccessful_builds, options) do
+          while true do
+            start_time=Time.now
+            repo=repo_q.pop
+            @logger.debug("thread #{Thread.current} will now process #{repo}") if options[:debug]
+            (result=process_name_of_business_component(repo.url, options)) =~ /^the build of.*was successful$/ ? successful_builds.push(repo.url) :
+              unsuccessful_builds.push(repo.url)
+            results_q.push(result)
+            result ? @logger.debug("thread #{Thread.current}, has processed #{repo} in #{Time.now - start_time} seconds:\n" + result) :
+              @logger.error("processing of name_of_business_component #{repo.url} returned null :(")
+            sleep 1
           end
         end
       end
 
-      if found == false && last_comp_flag == false
-        error_log << "\t #{last_comp_line}\n\t #{fail_line}"
-        last_comp_flag=true
-      elsif found == false
-        error_log <<  "\t #{fail_line}"
-      end
-    end
-    #fixme remove debugging
-    puts "error log; " + error_log.to_s
-    puts "last_comp_flag: " + last_comp_flag.to_s
-    #    puts "last_comp_line: " + last_comp_line.to_s
-    #    puts "fail_line: " + fail_line.to_s
-    return error_log
-  end
-
-  def run
-    @logger=LogDelegator.new
-
-    options, repo_list = init
-
-    if repo_list.length == 0
-      @logger.fatal("the list of repos provided is empty: #{repo_list.to_s}, nothing to do here.. Exiting..")
-      exit 0
-    end
-
-    successful_builds=Queue.new
-    unsuccessful_builds=Queue.new
-    repo_q=Queue.new
-    results_q=Queue.new
-
-    valid_repos = lambda do
-      valid_repos=[]
-      repo_list.each do |repo|
-        (valid_url=get_valid_url(repo,options)) ? valid_repos << valid_url : next
-      end
-      valid_repos
-    end
-
-    valid_repos.call.each do |repo|
-      repo_q.push(repo)
-    end
-
-    @logger.debug("spawning #{options[:thread_count]} thread(s) to process #{repo_q.length} repositories")
-
-    thread_arr=Array.new(options[:thread_count])
-    for thread_num in (0..thread_arr.length - 1) do
-      thread_arr[thread_num]=Thread.new(repo_q, results_q, successful_builds, unsuccessful_builds, options) do
-        while true do
-          start_time=Time.now
-          repo=repo_q.pop
-          @logger.debug("thread #{Thread.current} will now process #{repo}") if options[:debug]
-          (result=process_name_of_business_component(repo.url, options)) =~ /^the build of.*was successful$/ ? successful_builds.push(repo.url) :
-            unsuccessful_builds.push(repo.url)
-          results_q.push(result)
-          result ? @logger.debug("thread #{Thread.current}, has processed #{repo} in #{Time.now - start_time} seconds:\n" + result) :
-            @logger.error("processing of name_of_business_component #{repo.url} returned null :(")
-          sleep 1
-        end
-      end
-    end
-
-    while true
-      @logger.debug("repo_q.empty?: " + repo_q.empty?.to_s + " repo_q.num_waiting: " + repo_q.num_waiting.to_s + 
-          " thread_arr: " + thread_arr.to_s + 
-          " results_q.empty?: " + results_q.empty?.to_s + 
-          " results_q.num_waiting: " + results_q.num_waiting.to_s)
+      while true
+        @logger.debug("repo_q.empty?: " + repo_q.empty?.to_s + " repo_q.num_waiting: " + repo_q.num_waiting.to_s + 
+            " thread_arr: " + thread_arr.to_s + 
+            " results_q.empty?: " + results_q.empty?.to_s + 
+            " results_q.num_waiting: " + results_q.num_waiting.to_s)
       
-      break if thread_arr.reduce { |all_asleep, thread| thread.stop? ? all_asleep = all_asleep && true : all_asleep = all_asleep && false} &&
-        repo_q.empty? &&
-        results_q.num_waiting == 0
-      sleep 1
-    end
-
-    thread_arr.each do |thread|
-      thread.join 10
-    end
-
-    #fixme -- remove comments
-    #puts thread_arr.to_s
-    #thread_arr.each do |thread|
-    # thread.to_s.include?("dead") ? (move_on=1;break) : puts("the thread status is : #{thread.status}")
-    #end
-    #end
-    #check if threads are done
-
-    if results_q.length > 0
-      @logger.info("the build(s) completed, the results are: \n")
-      (1..results_q.length).each do
-        @logger.info(results_q.pop)
+        break if thread_arr.reduce { |all_asleep, thread| thread.stop? ? all_asleep = all_asleep && true : all_asleep = all_asleep && false} &&
+          repo_q.empty? &&
+          results_q.num_waiting == 0
+        sleep 1
       end
 
-      if successful_builds.length > 0
-        @logger.info("summary:")
-        @logger.info("the successful builds were:\n")
-        (1..successful_builds.length).each do
-          @logger.info(successful_builds.pop)
+      thread_arr.each do |thread|
+        thread.join 10
+      end
+
+      #fixme -- remove comments
+      #puts thread_arr.to_s
+      #thread_arr.each do |thread|
+      # thread.to_s.include?("dead") ? (move_on=1;break) : puts("the thread status is : #{thread.status}")
+      #end
+      #end
+      #check if threads are done
+
+      if results_q.length > 0
+        @logger.info("the build(s) completed, the results are: \n")
+        (1..results_q.length).each do
+          @logger.info(results_q.pop)
         end
-      end
 
-      if unsuccessful_builds.length > 0
-        @logger.info("the failed builds were:\n")
-        (1..unsuccessful_builds.length).each do
-          @logger.info(unsuccessful_builds.pop)
+        if successful_builds.length > 0
+          @logger.info("summary:")
+          @logger.info("the successful builds were:\n")
+          (1..successful_builds.length).each do
+            @logger.info(successful_builds.pop)
+          end
         end
+
+        if unsuccessful_builds.length > 0
+          @logger.info("the failed builds were:\n")
+          (1..unsuccessful_builds.length).each do
+            @logger.info(unsuccessful_builds.pop)
+          end
+        end
+      else
+        @logger.error("\nthe results queue is empty.. something went horribly wrong.. :(")
       end
-    else
-      @logger.error("\nthe results queue is empty.. something went horribly wrong.. :(")
+    ensure
+      @logger.debug("adieu.. run finished @#{Time.now}")
+      @logger.close
     end
-  ensure
-    @logger.debug("adieu.. run finished @#{Time.now}")
-    @logger.close
   end
-end
 
-include TriggerMultipleJenkinsJobs
-TriggerMultipleJenkinsJobs::run
+  include TriggerMultipleJenkinsJobs
+  TriggerMultipleJenkinsJobs::run
