@@ -21,6 +21,7 @@
 #fixme -- remove 'debug' puts statements
 #todo -- ponder about using abort_on_exception
 #todo -- min-free jenkins workers option (parallel runs are constrained by the minimum free workers option)
+#todo -- commandline args
 
 require 'rest-client'
 require 'nokogiri'
@@ -65,7 +66,7 @@ module TriggerMultipleJenkinsJobs
   end
 
   def read_conf
-    options={:credentials=>{:username=>'', :password=>''}, :url=>'', :thread_count=>''}
+    options={:credentials=>{:username=>'', :password=>''}, :url=>'', :thread_count=>'', :minfree_workers=>''}
     File.read('./jenkins.conf').split("\n").each do |line|
       case line.split(" ")[0]
       when 'url'
@@ -125,6 +126,12 @@ module TriggerMultipleJenkinsJobs
       when '-d'   #if the first argument "word" is '-d' enable the hidden top secret debug mode
         debug=true
         commandline_args.delete('-d')
+      when /^-t[0-9]{1,2}$/   #fixme -- not ready, will crash and burn if invoked
+        options[:thread_count]=arg.tr('-t', '').to_i
+        commandline_args.delete(arg)
+      when /^-m[0-9]{1,2}$/   #fixme -- not ready, will crash and burn if invoked
+        options[:minfree_workers]=arg.tr('-m', '').to_i
+        commandline_args.delete(arg)
       end
     end
     
@@ -422,7 +429,7 @@ module TriggerMultipleJenkinsJobs
   end
 
   class WorkerPool
-    attr_reader(:thread_arr)
+    attr_reader :thread_arr
   
     def initialize(logger, thread_num, repo_q, results_q, successful_builds, unsuccessful_builds, options)
       @thread_arr=Array.new(thread_num)
@@ -456,7 +463,7 @@ module TriggerMultipleJenkinsJobs
   class Scheduler 
     include TriggerMultipleJenkinsJobs
   
-    attr_reader(:successful_builds, :unsuccessful_builds, :repo_q, :results_q)
+    attr_reader :successful_builds, :unsuccessful_builds, :repo_q, :results_q
   
     def initialize(logger, options, repo_list)
       @logger=logger
@@ -531,8 +538,6 @@ module TriggerMultipleJenkinsJobs
       @logger.fatal("the list of repos provided is empty: #{repo_list.to_s}, nothing to do here.. Exiting..")
       exit 0
     end
-
-    #successful_builds, unsuccessful_builds, repo_q, results_q = init_queues(repo_list, options)
 
     scheduler=Scheduler.new(@logger, options, repo_list)
 
